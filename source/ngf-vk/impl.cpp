@@ -117,7 +117,8 @@ struct ngfvk_swapchain {
   ngfi::fixed_array<ngfi::unique_ptr<ngf_image_t>> wrapper_imgs;
   ngfi::fixed_array<ngfi::unique_ptr<ngf_image_t>> multisample_imgs;
   ngfi::fixed_array<VkImageView>                   multisample_img_views;
-  ngfi::fixed_array<VkSemaphore>                   img_sems;
+  ngfi::fixed_array<VkSemaphore>                   acquire_sems;
+  ngfi::fixed_array<VkSemaphore>                   submit_sems;
   ngfi::fixed_array<VkFramebuffer>                 framebufs;
   ngf_image                                        depth_img;
   uint32_t         nimgs;      // < Total number of images in the swapchain.
@@ -256,7 +257,6 @@ using ngfvk_retire_lists = ngfvk_retire_lists_t<
 struct ngfvk_frame_resources {
   ngfi::arena                 res_frame_arena;
   ngfi::array<ngf_cmd_buffer> submitted_cmd_bufs;  // < Submitted ngf command buffers.
-  VkSemaphore                 semaphore;           // < Signalled when the last cmd buffer finishes.
 
   // Resources that should be disposed of at some point after this
   // frame's completion.
@@ -1691,15 +1691,6 @@ ngfi::maybe_ngfptr<ngf_context_t> ngf_context_t::make(const ngf_context_info& in
   for (uint32_t f = 0u; f < max_inflight_frames; ++f) {
     ctx->frame_res[f].res_frame_arena.set_block_size(1024);
     ctx->frame_res[f].submitted_cmd_bufs.reserve(8u);
-    ctx->frame_res[f].semaphore = VK_NULL_HANDLE;
-
-    const VkSemaphoreCreateInfo semaphore_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = NULL,
-        .flags = 0u,
-    };
-    vk_err = vkCreateSemaphore(_vk.device, &semaphore_info, NULL, &ctx->frame_res[f].semaphore);
-    if (vk_err != VK_SUCCESS) { return NGF_ERROR_OBJECT_CREATION_FAILED; }
     const VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = NULL,
@@ -1755,7 +1746,6 @@ ngf_context_t::~ngf_context_t() noexcept {
     for (uint32_t i = 0u; i < sizeof(fr.fences) / sizeof(VkFence); ++i) {
       vkDestroyFence(_vk.device, fr.fences[i], NULL);
     }
-    if (fr.semaphore != VK_NULL_HANDLE) { vkDestroySemaphore(_vk.device, fr.semaphore, nullptr); }
   }
 
   for (size_t p = 0; p < desc_superpools.size(); ++p) {
@@ -2792,7 +2782,7 @@ static ngf_error ngfvk_maybe_acquire_swapchain_image() {
           _vk.device,
           CURRENT_CONTEXT->swapchain->vk_swapchain,
           UINT64_MAX,
-          CURRENT_CONTEXT->swapchain->img_sems[CURRENT_CONTEXT->frame_id],
+          CURRENT_CONTEXT->swapchain->acquire_sems[CURRENT_CONTEXT->frame_id],
           VK_NULL_HANDLE,
           &CURRENT_CONTEXT->swapchain->image_idx);
       if (acquire_result == VK_SUBOPTIMAL_KHR) {
@@ -2810,7 +2800,10 @@ static ngf_error ngfvk_maybe_acquire_swapchain_image() {
 
 ngfvk_swapchain::~ngfvk_swapchain() noexcept {
   vkDeviceWaitIdle(_vk.device);
-  for (VkSemaphore sem : img_sems) {
+  for (VkSemaphore sem : acquire_sems) {
+    if (sem != VK_NULL_HANDLE) { vkDestroySemaphore(_vk.device, sem, nullptr); }
+  }
+  for (VkSemaphore sem : submit_sems) {
     if (sem != VK_NULL_HANDLE) { vkDestroySemaphore(_vk.device, sem, nullptr); }
   }
   for (VkFramebuffer fb : framebufs) {
@@ -3047,17 +3040,24 @@ ngfi::maybe_ngfptr<ngfvk_swapchain> ngfvk_swapchain::make(
     if (vk_err != VK_SUCCESS) { return NGF_ERROR_OBJECT_CREATION_FAILED; }
   }
 
-  // Create semaphores to be signaled when a swapchain image becomes available.
-  swapchain->img_sems = ngfi::fixed_array<VkSemaphore> {swapchain->nimgs};
-  if (swapchain->img_sems.data() == nullptr) { return NGF_ERROR_OUT_OF_MEM; }
-  memset(&swapchain->img_sems[0], 0, sizeof(VkSemaphore) * swapchain->nimgs);
+  // Create semaphores to be signaled when a swapchain image is acquired,
+  // and when a swapchain image is ready to be presented.
+  swapchain->acquire_sems = ngfi::fixed_array<VkSemaphore> {swapchain->nimgs};
+  swapchain->submit_sems = ngfi::fixed_array<VkSemaphore> { swapchain->nimgs};
+  if (swapchain->acquire_sems.data() == nullptr ||
+      swapchain->submit_sems.data() == nullptr) { return NGF_ERROR_OUT_OF_MEM; }
+  memset(&swapchain->acquire_sems[0], 0, sizeof(VkSemaphore) * swapchain->nimgs);
+  memset(&swapchain->submit_sems[0], 0, sizeof(VkSemaphore) * swapchain->nimgs);
   for (uint32_t s = 0u; s < swapchain->nimgs; ++s) {
     const VkSemaphoreCreateInfo sem_info = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         .pNext = NULL,
         .flags = 0};
-    vk_err = vkCreateSemaphore(_vk.device, &sem_info, NULL, &swapchain->img_sems[s]);
+    vk_err = vkCreateSemaphore(_vk.device, &sem_info, NULL, &swapchain->acquire_sems[s]);
     if (vk_err != VK_SUCCESS) { return NGF_ERROR_OBJECT_CREATION_FAILED; }
+    vk_err = vkCreateSemaphore(_vk.device, &sem_info, NULL, &swapchain->submit_sems[s]);
+    if (vk_err != VK_SUCCESS) { return NGF_ERROR_OBJECT_CREATION_FAILED; }
+
   }
   swapchain->image_idx = 0U;
   swapchain->width     = swapchain_info.width;
@@ -4599,7 +4599,7 @@ static ngf_error ngfvk_submit_pending_cmd_buffers(
                .commandBufferCount   = submitted_cmd_buf_handles_idx,
                .pCommandBuffers      = submitted_cmd_buf_handles,
                .signalSemaphoreCount = needs_present ? 1u : 0u,
-               .pSignalSemaphores    = needs_present ? &(frame_res->semaphore) : NULL};
+               .pSignalSemaphores    = needs_present ? &CURRENT_CONTEXT->swapchain->submit_sems[CURRENT_CONTEXT->swapchain->image_idx] : NULL};
 
   VkResult submit_result = vkQueueSubmit(_vk.gfx_queue, 1, &submit_info, signal_fence);
 
@@ -5590,7 +5590,7 @@ extern "C" ngf_error ngf_end_frame(ngf_frame_token token) NGF_NOEXCEPT {
   // Submit pending commands & present.
   VkSemaphore image_semaphore = VK_NULL_HANDLE;
   const bool  needs_present   = CURRENT_CONTEXT->swapchain && CURRENT_CONTEXT->swapchain->vk_swapchain != VK_NULL_HANDLE;
-  if (needs_present) { image_semaphore = CURRENT_CONTEXT->swapchain->img_sems[fi]; }
+  if (needs_present) { image_semaphore = CURRENT_CONTEXT->swapchain->acquire_sems[fi]; }
 
   ngf_error submit_result = ngfvk_submit_pending_cmd_buffers(
       frame_res,
@@ -5603,7 +5603,7 @@ extern "C" ngf_error ngf_end_frame(ngf_frame_token token) NGF_NOEXCEPT {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext              = NULL,
         .waitSemaphoreCount = 1u,
-        .pWaitSemaphores    = &frame_res->semaphore,
+        .pWaitSemaphores    = &CURRENT_CONTEXT->swapchain->submit_sems[CURRENT_CONTEXT->swapchain->image_idx],
         .swapchainCount     = 1,
         .pSwapchains        = &CURRENT_CONTEXT->swapchain->vk_swapchain,
         .pImageIndices      = &CURRENT_CONTEXT->swapchain->image_idx,

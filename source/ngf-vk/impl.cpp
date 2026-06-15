@@ -2625,7 +2625,8 @@ ngfi::value_or_ngferr<ngfvk_alloc> ngfvk_alloc::make(const ngf_image_info& info)
   const bool is_xfer_src      = info.usage_hint & NGF_IMAGE_USAGE_XFER_SRC;
   const bool is_attachment    = info.usage_hint & NGF_IMAGE_USAGE_ATTACHMENT;
   const bool enable_auto_mips = info.usage_hint & NGF_IMAGE_USAGE_MIPMAP_GENERATION;
-  const bool is_transient     = info.usage_hint & ngfvk::global::img_usage_transient_attachment;
+  const bool is_transient     = info.usage_hint & (ngfvk::global::img_usage_transient_attachment |
+                                                   NGF_IMAGE_USAGE_TRANSIENT_ATTACHMENT);
   const bool is_depth_stencil = info.format == NGF_IMAGE_FORMAT_DEPTH16 ||
                                 info.format == NGF_IMAGE_FORMAT_DEPTH32 ||
                                 info.format == NGF_IMAGE_FORMAT_DEPTH24_STENCIL8 ||
@@ -2679,7 +2680,7 @@ ngfi::value_or_ngferr<ngfvk_alloc> ngfvk_alloc::make(const ngf_image_info& info)
       .flags          = 0u,
       .usage          = VMA_MEMORY_USAGE_GPU_ONLY,
       .requiredFlags  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-      .preferredFlags = 0u,
+      .preferredFlags = is_transient ? VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT : 0u,
       .memoryTypeBits = 0u,
       .pool           = VK_NULL_HANDLE,
       .pUserData      = (void*)0x1};
